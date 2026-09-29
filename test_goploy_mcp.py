@@ -8,6 +8,7 @@
 """
 
 import contextlib
+import json
 import re
 import sys
 import tempfile
@@ -243,7 +244,9 @@ class TestLogin(unittest.TestCase):
             return dict(kwargs)
 
         with mock.patch.object(g, "_http", return_value=(code, "msg", data, cookie_token)), \
-                mock.patch.object(g, "save_state", side_effect=fake_save):
+                mock.patch.object(g, "save_state", side_effect=fake_save), \
+                mock.patch.object(g, "load_config",
+                                  return_value={"host": "http://h", "account": "a", "password": "p"}):
             g.login()
         return captured
 
@@ -268,10 +271,12 @@ class TestLogin(unittest.TestCase):
         self.assertEqual(st["namespaces"], [{"namespaceId": 9, "namespaceName": "ok"}])
 
     def test_login_failure_no_retry(self):
-        with mock.patch.object(g, "_http", return_value=(1, "密码错误", None, "")):
+        with mock.patch.object(g, "_http", return_value=(1, "密码错误", None, "")), \
+                mock.patch.object(g, "load_config",
+                                  return_value={"host": "http://h", "account": "a", "password": "p"}):
             with self.assertRaises(g.GoployError) as cm:
                 g.login()
-            self.assertIn("登录失败", str(cm.exception))
+        self.assertIn("登录失败", str(cm.exception))
 
 
 class TestState(unittest.TestCase):
@@ -316,6 +321,68 @@ class TestResolveServer(unittest.TestCase):
             with self.assertRaises(g.GoployError) as cm:
                 g.resolve_server(7, None)
         self.assertIn("请指定 server_id", str(cm.exception))
+
+
+# ---------------- deploy tools ----------------
+
+class TestDeployTools(unittest.TestCase):
+    def test_deploy_list_brief_and_state_desc(self):
+        data = {"list": [{"id": 106, "name": "svc", "repoType": "git", "branch": "master",
+                          "deployState": 2, "lastPublishToken": "tk",
+                          "script": {"afterDeploy": {"content": "secret"}}}]}
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", return_value=data) as api:
+            out = g.deploy_list(None)
+        api.assert_called_once_with("/deploy/getList", namespace_id=11)
+        parsed = json.loads(out)
+        self.assertEqual(parsed[0]["id"], 106)
+        self.assertEqual(parsed[0]["deployStateDesc"], "部署成功")
+        self.assertNotIn("script", parsed[0])  # 不泄露脚本内容
+
+    def test_deploy_publish_body_and_token(self):
+        captured = {}
+
+        def fake_api(path, method="GET", body=None, namespace_id=None):
+            captured.update(path=path, method=method, body=body, ns=namespace_id)
+            return {"token": "tok-1"}
+
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=fake_api):
+            out = g.deploy_publish(106, commit="abc123", branch="dev", server_ids=[3, 5])
+        self.assertEqual(captured, {"path": "/deploy/publish", "method": "POST",
+                                    "body": {"projectId": 106, "commit": "abc123",
+                                             "branch": "dev", "serverIds": [3, 5]},
+                                    "ns": 11})
+        self.assertIn("tok-1", out)
+
+    def test_deploy_publish_minimal_body(self):
+        captured = {}
+
+        def fake_api(path, method="GET", body=None, namespace_id=None):
+            captured.update(body=body)
+            return {"token": "t"}
+
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=fake_api):
+            g.deploy_publish(106)
+        self.assertEqual(captured["body"], {"projectId": 106, "commit": "", "branch": ""})
+
+    def test_deploy_progress_path_and_state_desc(self):
+        captured = {}
+
+        def fake_api(path, method="GET", body=None, namespace_id=None):
+            captured.update(path=path, ns=namespace_id)
+            return {"state": 1, "stage": "Pull", "message": ""}
+
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=fake_api):
+            out = g.deploy_progress("uuid-token-9")
+        self.assertEqual(captured["path"],
+                         "/deploy/getPublishProgress?lastPublishToken=uuid-token-9")
+        self.assertEqual(captured["ns"], 11)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["stateDesc"], "进行中")
+        self.assertEqual(parsed["stage"], "Pull")
 
 
 # ---------------- ws_exec ----------------

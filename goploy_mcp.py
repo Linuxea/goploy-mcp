@@ -4,11 +4,14 @@
 # ///
 """goploy-mcp: goploy 运维平台 MCP server (stdio)
 
-封装 goploy 的用户/分组/服务器查询与远程命令执行：
-  - user_info  当前登录用户信息
-  - namespaces 分组(namespace)列表
-  - servers    分组下的服务器列表
-  - exec       在指定服务器上一次性执行 shell 命令
+封装 goploy 的用户/分组/服务器/部署查询与远程命令执行：
+  - user_info        当前登录用户信息
+  - namespaces       分组(namespace)列表
+  - servers          分组下的服务器列表
+  - deploy_list      分组下的可部署项目列表（部署依据）
+  - deploy_publish   发布（触发真实部署）指定项目
+  - deploy_progress  按发布令牌轮询发布进度
+  - exec             在指定服务器上一次性执行 shell 命令
 
 认证：账号密码自动登录换取 JWT cookie；每次响应的 Set-Cookie 新 token
 即时持久化（goploy 为滑动续期，活跃状态下永不过期）。
@@ -24,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -34,6 +37,8 @@ STATE_PATH = STATE_DIR / "state.json"
 
 LOGIN_EXPIRED = 10086
 ACCOUNT_DISABLED = 10000
+
+DEPLOY_STATE = {0: "未部署", 1: "部署中", 2: "部署成功", 3: "部署失败"}
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[=>]")
 PROMPT_RE = re.compile(r"\][#$] ")
@@ -431,6 +436,54 @@ def servers(namespace_id: int | None = None) -> str:
     brief = [{"id": s.get("id"), "name": s.get("name"), "ip": s.get("ip"),
               "owner": s.get("owner"), "description": s.get("description")} for s in servers_]
     return json.dumps(brief, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def deploy_list(namespace_id: int | None = None) -> str:
+    """列出分组下的可部署项目（部署依据：项目 id、分支、部署状态、最近发布令牌等）。
+    namespace_id 不传时：唯一分组自动选择，多分组会返回分组列表提示选择。"""
+    ns_id, _ = resolve_namespace(namespace_id)
+    data = api_call("/deploy/getList", namespace_id=ns_id)
+    projects = (data or {}).get("list") or []
+    brief = [{"id": p.get("id"), "name": p.get("name"), "repoType": p.get("repoType"),
+              "url": p.get("url"), "branch": p.get("branch"), "path": p.get("path"),
+              "environment": p.get("environment"), "review": p.get("review"),
+              "deployState": p.get("deployState"),
+              "deployStateDesc": DEPLOY_STATE.get(p.get("deployState"), "未知"),
+              "publisherName": p.get("publisherName"), "updateTime": p.get("updateTime"),
+              "lastPublishToken": p.get("lastPublishToken")} for p in projects]
+    return json.dumps(brief, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def deploy_publish(project_id: int, commit: str = "", branch: str = "",
+                   server_ids: list[int] | None = None,
+                   namespace_id: int | None = None) -> str:
+    """发布（触发真实部署）指定项目，返回发布令牌 token，可用 deploy_progress 轮询进度。
+    commit/branch 留空则使用项目配置的默认值；开启审核(review)的项目必须提供 commit。
+    server_ids 可选，传入后仅发布到项目绑定的部分服务器（灰度发布）。
+    注意：会真实执行发布，请先用 deploy_list 确认 project_id。"""
+    ns_id, _ = resolve_namespace(namespace_id)
+    body: dict = {"projectId": int(project_id), "commit": commit, "branch": branch}
+    if server_ids:
+        body["serverIds"] = [int(s) for s in server_ids]
+    data = api_call("/deploy/publish", "POST", body, namespace_id=ns_id)
+    token = data.get("token", "") if isinstance(data, dict) else ""
+    return json.dumps({"token": token,
+                       "hint": "发布已触发，可用 deploy_progress(last_publish_token=token) 轮询进度"},
+                      ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def deploy_progress(last_publish_token: str, namespace_id: int | None = None) -> str:
+    """按发布令牌查询发布进度：state 1=进行中 2=完成 0=失败，附当前阶段 stage 与错误信息 message。
+    令牌来自 deploy_publish 返回或 deploy_list 里的 lastPublishToken。"""
+    ns_id, _ = resolve_namespace(namespace_id)
+    data = api_call(f"/deploy/getPublishProgress?lastPublishToken={quote(last_publish_token)}",
+                    namespace_id=ns_id)
+    if isinstance(data, dict):
+        data = dict(data, stateDesc={0: "失败", 1: "进行中", 2: "完成"}.get(data.get("state"), "未知"))
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
