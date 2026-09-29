@@ -215,6 +215,22 @@ def resolve_server(namespace_id: int | None, server_id: int | None) -> tuple[int
                       + json.dumps(brief, ensure_ascii=False))
 
 
+def deploy_list_raw(namespace_id: int) -> list[dict]:
+    """原始项目列表（/deploy/getList 的 data.list）"""
+    data = api_call("/deploy/getList", namespace_id=namespace_id)
+    return (data or {}).get("list") or []
+
+
+def project_summary(p: dict) -> dict:
+    """单个项目的状态摘要（publish 兜底 / progress 回退共用）"""
+    return {"projectId": p.get("id"), "name": p.get("name"), "branch": p.get("branch"),
+            "deployState": p.get("deployState"),
+            "deployStateDesc": DEPLOY_STATE.get(p.get("deployState"), "未知"),
+            "publisherName": p.get("publisherName"),
+            "updateTime": p.get("updateTime"),
+            "lastPublishToken": p.get("lastPublishToken")}
+
+
 # ---------------- WebSocket 一次性终端执行 ----------------
 
 class _WS:
@@ -443,8 +459,7 @@ def deploy_list(namespace_id: int | None = None) -> str:
     """列出分组下的可部署项目（部署依据：项目 id、分支、部署状态、最近发布令牌等）。
     namespace_id 不传时：唯一分组自动选择，多分组会返回分组列表提示选择。"""
     ns_id, _ = resolve_namespace(namespace_id)
-    data = api_call("/deploy/getList", namespace_id=ns_id)
-    projects = (data or {}).get("list") or []
+    projects = deploy_list_raw(ns_id)
     brief = [{"id": p.get("id"), "name": p.get("name"), "repoType": p.get("repoType"),
               "url": p.get("url"), "branch": p.get("branch"), "path": p.get("path"),
               "environment": p.get("environment"), "review": p.get("review"),
@@ -462,6 +477,7 @@ def deploy_publish(project_id: int, commit: str = "", branch: str = "",
     """发布（触发真实部署）指定项目，返回发布令牌 token，可用 deploy_progress 轮询进度。
     commit/branch 留空则使用项目配置的默认值；开启审核(review)的项目必须提供 commit。
     server_ids 可选，传入后仅发布到项目绑定的部分服务器（灰度发布）。
+    部分自建服务端 publish 不回 token，会自动查 deploy_list 兜底取 lastPublishToken 与初始状态。
     注意：会真实执行发布，请先用 deploy_list 确认 project_id。"""
     ns_id, _ = resolve_namespace(namespace_id)
     body: dict = {"projectId": int(project_id), "commit": commit, "branch": branch}
@@ -469,18 +485,43 @@ def deploy_publish(project_id: int, commit: str = "", branch: str = "",
         body["serverIds"] = [int(s) for s in server_ids]
     data = api_call("/deploy/publish", "POST", body, namespace_id=ns_id)
     token = data.get("token", "") if isinstance(data, dict) else ""
-    return json.dumps({"token": token,
-                       "hint": "发布已触发，可用 deploy_progress(last_publish_token=token) 轮询进度"},
-                      ensure_ascii=False, indent=2)
+    result: dict = {"token": token}
+    if not token:
+        # 兜底：服务端不回 token 时立即查 getList 取 lastPublishToken 与初始状态
+        for p in deploy_list_raw(ns_id):
+            if p.get("id") == int(project_id):
+                result.update(project_summary(p))
+                result["token"] = p.get("lastPublishToken") or ""
+                result["tokenSource"] = "getList"
+                break
+    result["hint"] = ("发布已触发，可用 deploy_progress(last_publish_token=token) 轮询进度"
+                      if result["token"]
+                      else "发布已触发，但未能获取发布令牌；可用 deploy_list 轮询项目 deployState")
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 def deploy_progress(last_publish_token: str, namespace_id: int | None = None) -> str:
     """按发布令牌查询发布进度：state 1=进行中 2=完成 0=失败，附当前阶段 stage 与错误信息 message。
-    令牌来自 deploy_publish 返回或 deploy_list 里的 lastPublishToken。"""
+    令牌来自 deploy_publish 返回或 deploy_list 里的 lastPublishToken。
+    部分自建服务端没有 getPublishProgress 路由（No such method），将自动回退为
+    deploy_list 按令牌匹配项目并返回 deployState（0=失败 1=部署中 2=成功 3=失败的语义见 deployStateDesc）。"""
     ns_id, _ = resolve_namespace(namespace_id)
-    data = api_call(f"/deploy/getPublishProgress?lastPublishToken={quote(last_publish_token)}",
-                    namespace_id=ns_id)
+    try:
+        data = api_call(f"/deploy/getPublishProgress?lastPublishToken={quote(last_publish_token)}",
+                        namespace_id=ns_id)
+    except GoployError as orig:
+        # 回退：无 getPublishProgress 路由的自建服务端，用 getList 按令牌匹配项目状态
+        try:
+            projects = deploy_list_raw(ns_id)
+        except GoployError:
+            raise orig
+        for p in projects:
+            if p.get("lastPublishToken") == last_publish_token:
+                out = project_summary(p)
+                out["source"] = "fallback:getList"
+                return json.dumps(out, ensure_ascii=False, indent=2)
+        raise
     if isinstance(data, dict):
         data = dict(data, stateDesc={0: "失败", 1: "进行中", 2: "完成"}.get(data.get("state"), "未知"))
     return json.dumps(data, ensure_ascii=False, indent=2)

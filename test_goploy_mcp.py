@@ -384,6 +384,57 @@ class TestDeployTools(unittest.TestCase):
         self.assertEqual(parsed["stateDesc"], "进行中")
         self.assertEqual(parsed["stage"], "Pull")
 
+    def test_deploy_publish_fallback_token_when_empty(self):
+        """回归：自建服务端 publish 不回 token 时，自动查 getList 兜底"""
+        responses = [
+            {"token": ""},  # publish 响应空 token
+            {"list": [{"id": 103, "name": "user", "branch": "beta", "deployState": 1,
+                       "lastPublishToken": "fb-tok", "updateTime": "2026-09-29 18:36:01"}]},
+        ]
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=responses):
+            out = g.deploy_publish(103)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["token"], "fb-tok")
+        self.assertEqual(parsed["tokenSource"], "getList")
+        self.assertEqual(parsed["deployStateDesc"], "部署中")
+
+    def test_deploy_publish_fallback_no_match_keeps_empty(self):
+        responses = [{"token": ""}, {"list": []}]
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=responses):
+            out = g.deploy_publish(999)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["token"], "")
+        self.assertIn("deploy_list", parsed["hint"])  # hint 引导改用 deploy_list
+
+    def test_deploy_progress_fallback_on_missing_route(self):
+        """回归：服务端缺 getPublishProgress 路由时，回退 getList 按令牌匹配"""
+        def fake_api(path, method="GET", body=None, namespace_id=None):
+            if "getPublishProgress" in path:
+                raise g.GoployError("goploy 接口错误 code=1: No such method")
+            return {"list": [{"id": 103, "name": "user", "deployState": 2,
+                              "lastPublishToken": "tk-9", "updateTime": "t"}]}
+
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=fake_api):
+            out = g.deploy_progress("tk-9")
+        parsed = json.loads(out)
+        self.assertEqual(parsed["deployStateDesc"], "部署成功")
+        self.assertEqual(parsed["source"], "fallback:getList")
+
+    def test_deploy_progress_fallback_no_match_reraises(self):
+        def fake_api(path, method="GET", body=None, namespace_id=None):
+            if "getPublishProgress" in path:
+                raise g.GoployError("goploy 接口错误 code=1: No such method")
+            return {"list": []}
+
+        with mock.patch.object(g, "resolve_namespace", return_value=(11, [])), \
+                mock.patch.object(g, "api_call", side_effect=fake_api):
+            with self.assertRaises(g.GoployError) as cm:
+                g.deploy_progress("nope")
+        self.assertIn("No such method", str(cm.exception))
+
 
 # ---------------- ws_exec ----------------
 

@@ -25,3 +25,5 @@
 - 多 namespace / 多 server 时未显式传 id 会报错并返回列表提示，这是设计行为，不是 bug
 - 提示符探测 `PROMPT_RE`（`\][#$] `）依赖 PS1 含 `]# `/`]$ `：不匹配的主机（zsh 默认提示符等）阶段 1 每次耗满 5s，横幅不被截掉——已知限制，非 bug
 - mock 测试 `socket.create_connection` 时必须给 FakeSock 返回真实的 101 响应；返回 MagicMock 会让握手 while 循环死循环挂死测试
+- 目标实例（hiloconn 自建 goploy）缺 `/deploy/getPublishProgress` 路由（报 No such method），且 `/deploy/publish` 响应不带 token——所以 `deploy_publish` 空 token 时用 `/deploy/getList` 兜底取 `lastPublishToken`，`deploy_progress` 失败时回退 getList 按令牌匹配 `deployState`，勿删这两个兜底
+- 两套状态语义易混：project 的 `deployState` 0=未部署/1=部署中/2=成功/3=失败（`DEPLOY_STATE` 表）；getPublishProgress 的 `state` 0=失败/1=进行中/2=完成
